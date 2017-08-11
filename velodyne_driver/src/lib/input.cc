@@ -31,12 +31,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <boost/thread.hpp>
 #include <velodyne_driver/input.h>
 
 namespace velodyne_driver
 {
   static const size_t packet_size =
     sizeof(velodyne_msgs::VelodynePacket().data);
+
+  static const size_t position_packet_size = 512;
 
   ////////////////////////////////////////////////////////////////////////
   // Input base class implementation
@@ -66,10 +69,11 @@ namespace velodyne_driver
    *  @param private_nh ROS private handle for calling node.
    *  @param port UDP port number
    */
-  InputSocket::InputSocket(ros::NodeHandle private_nh, uint16_t port):
+  InputSocket::InputSocket(ros::NodeHandle private_nh, uint16_t port, uint16_t port2):
     Input(private_nh, port)
   {
     sockfd_ = -1;
+    sockfd2_ = -1;
     
     if (!devip_str_.empty()) {
       inet_aton(devip_str_.c_str(),&devip_);
@@ -83,16 +87,33 @@ namespace velodyne_driver
         perror("socket");               // TODO: ROS_ERROR errno
         return;
       }
+
+    sockfd2_ = socket(PF_INET, SOCK_DGRAM, 0);
+    if (sockfd2_ == -1)
+      {
+        perror("socket2");               // TODO: ROS_ERROR errno
+        return;
+      }
   
     sockaddr_in my_addr;                     // my address information
     memset(&my_addr, 0, sizeof(my_addr));    // initialize to zeros
     my_addr.sin_family = AF_INET;            // host byte order
     my_addr.sin_port = htons(port);          // port in network byte order
     my_addr.sin_addr.s_addr = INADDR_ANY;    // automatically fill in my IP
-  
     if (bind(sockfd_, (sockaddr *)&my_addr, sizeof(sockaddr)) == -1)
       {
         perror("bind");                 // TODO: ROS_ERROR errno
+        return;
+      }
+
+    sockaddr_in my_addr2;                     // my address information
+    memset(&my_addr2, 0, sizeof(my_addr2));    // initialize to zeros
+    my_addr2.sin_family = AF_INET;            // host byte order
+    my_addr2.sin_port = htons(port2);          // port in network byte order
+    my_addr2.sin_addr.s_addr = INADDR_ANY;    // automatically fill in my IP
+    if (bind(sockfd2_, (sockaddr *)&my_addr2, sizeof(sockaddr)) == -1)
+      {
+        perror("bind2");                 // TODO: ROS_ERROR errno
         return;
       }
   
@@ -102,13 +123,26 @@ namespace velodyne_driver
         return;
       }
 
+    if (fcntl(sockfd2_,F_SETFL, O_NONBLOCK|FASYNC) < 0)
+      {
+        perror("non-block2");
+        return;
+      }
+
     ROS_DEBUG("Velodyne socket fd is %d\n", sockfd_);
+    ROS_DEBUG("Velodyne socket fd 2 is %d\n", sockfd2_);
+
+    positionPacketPollThread_ = boost::shared_ptr< boost::thread >
+      (new boost::thread(boost::bind(&InputSocket::positionPacketPoll, this)));
+
+    this->imu_pc_sub_ = private_nh_.subscribe("/mti/sensor/packet_counter", 20, &InputSocket::imuPacketCounterCallback, this);
   }
 
   /** @brief destructor */
   InputSocket::~InputSocket(void)
   {
     (void) close(sockfd_);
+    (void) close(sockfd2_);
   }
 
   /** @brief Get one velodyne packet. */
@@ -204,7 +238,195 @@ namespace velodyne_driver
     double time2 = ros::Time::now().toSec();
     pkt->stamp = ros::Time((time2 + time1) / 2.0 + time_offset);
 
+    // Update timestamp by IMU
+    if (imu_pc_queue_.size() != 0)
+    {
+      uint32_t h_offset;
+      *((uint8_t*)&h_offset + 0) = pkt->data[packet_size-6];
+      *((uint8_t*)&h_offset + 1) = pkt->data[packet_size-5];
+      *((uint8_t*)&h_offset + 2) = pkt->data[packet_size-4];
+      *((uint8_t*)&h_offset + 3) = pkt->data[packet_size-3];
+
+      static uint64_t last_ts = 0L; // in us
+      uint64_t ts1 = pos_pkt_.hh     * 3600000000 + h_offset;
+      uint64_t ts2 = (pos_pkt_.hh+1) * 3600000000 + h_offset;
+      if (std::abs(ts1-last_ts) < std::abs(ts2-last_ts))
+      {
+        last_ts = ts1;
+      }
+      else
+      {
+        last_ts = ts2;
+      }
+
+      double pc = fmod(((double)last_ts / 1000 / 1000 * 400), 1<<16);
+      double min_t_diff = std::numeric_limits<double>::max();
+      int min_i = -1;
+//      ROS_DEBUG("pc=%lf", pc);
+      boost::mutex::scoped_lock lock(imu_pc_queue_mutex_);
+      for (int i = 0; i < imu_pc_queue_.size(); ++i)
+      {
+        double t_diff = std::abs(imu_pc_queue_[i]->counter - pc);
+//        ROS_DEBUG("pc[%d]=%d", i, imu_pc_queue_[i]->counter);
+        if (min_t_diff > t_diff)
+        {
+          min_t_diff = t_diff;
+          min_i = i;
+        }
+      }
+      assert(min_i != -1);
+      ROS_DEBUG("min_t_diff:%lf ms, min_i:%d", min_t_diff/400*1000, min_i);
+      if (min_t_diff > 1)
+        ROS_WARN("No IMU packet counter message received");
+      else
+        pkt->stamp.fromSec(imu_pc_queue_[min_i]->header.stamp.toSec() + (pc - imu_pc_queue_[min_i]->counter)/400);
+    }
+    else
+    {
+      ROS_WARN("No IMU packet counter message received");
+    }
+
     return 0;
+  }
+
+  int InputSocket::getPositionPacket(PositionPacket *pkt)
+  {
+//    double time1 = ros::Time::now().toSec();
+    uint8_t position_pkt[position_packet_size];
+
+    struct pollfd fds[1];
+    fds[0].fd = sockfd2_;
+    fds[0].events = POLLIN;
+    static const int POLL_TIMEOUT = 1000; // one second (in msec)
+
+    sockaddr_in sender_address;
+    socklen_t sender_address_len = sizeof(sender_address);
+
+    while (true)
+      {
+        // Unfortunately, the Linux kernel recvfrom() implementation
+        // uses a non-interruptible sleep() when waiting for data,
+        // which would cause this method to hang if the device is not
+        // providing data.  We poll() the device first to make sure
+        // the recvfrom() will not block.
+        //
+        // Note, however, that there is a known Linux kernel bug:
+        //
+        //   Under Linux, select() may report a socket file descriptor
+        //   as "ready for reading", while nevertheless a subsequent
+        //   read blocks.  This could for example happen when data has
+        //   arrived but upon examination has wrong checksum and is
+        //   discarded.  There may be other circumstances in which a
+        //   file descriptor is spuriously reported as ready.  Thus it
+        //   may be safer to use O_NONBLOCK on sockets that should not
+        //   block.
+
+        // poll() until input available
+        do
+          {
+            int retval = poll(fds, 1, POLL_TIMEOUT);
+            if (retval < 0)             // poll() error?
+              {
+                if (errno != EINTR)
+                  ROS_ERROR("poll2() error: %s", strerror(errno));
+                return 1;
+              }
+            if (retval == 0)            // poll() timeout?
+              {
+                ROS_WARN("Velodyne poll2() timeout");
+                return 1;
+              }
+            if ((fds[0].revents & POLLERR)
+                || (fds[0].revents & POLLHUP)
+                || (fds[0].revents & POLLNVAL)) // device error?
+              {
+                ROS_ERROR("poll2() reports Velodyne error");
+                return 1;
+              }
+          } while ((fds[0].revents & POLLIN) == 0);
+
+        // Receive packets that should now be available from the
+        // socket using a blocking read.
+        ssize_t nbytes = recvfrom(sockfd2_, &position_pkt,
+                                  position_packet_size,  0,
+                                  (sockaddr*) &sender_address,
+                                  &sender_address_len);
+
+        if (nbytes < 0)
+          {
+            if (errno != EWOULDBLOCK)
+              {
+                perror("recvfail2");
+                ROS_INFO("recvfail2");
+                return 1;
+              }
+          }
+        else if ((size_t) nbytes == position_packet_size)
+          {
+            // read successful,
+            // if packet is not from the lidar scanner we selected by IP,
+            // continue otherwise we are done
+            if(devip_str_ != ""
+               && sender_address.sin_addr.s_addr != devip_.s_addr)
+              continue;
+            else
+              break; //done
+          }
+
+        ROS_DEBUG_STREAM("incomplete Velodyne position packet read: "
+                         << nbytes << " bytes");
+      }
+
+    // Average the times at which we begin and end reading.  Use that to
+    // estimate when the scan occurred. Add the time offset.
+//    double time2 = ros::Time::now().toSec();
+//    pkt->stamp = ros::Time((time2 + time1) / 2.0 + time_offset);
+    char gprmc[73];
+    memcpy(gprmc, position_pkt + 206, 72);
+    gprmc[72] = '\0';
+    ROS_DEBUG("NMEA $GPRMC sentence: `%s`", gprmc);
+
+    pkt->hh = (gprmc[ 7] -  '0') * 10 + gprmc[ 8] - '0';
+    pkt->mm = (gprmc[ 9] -  '0') * 10 + gprmc[10] - '0';
+    pkt->ss = (gprmc[11] -  '0') * 10 + gprmc[12] - '0';
+    return 0;
+  }
+
+  bool InputSocket::pollPositionPacket()
+  {
+    while (true)
+      {
+        // keep reading until full packet received
+//        PositionPacket pkt;
+        int rc = this->getPositionPacket(&pos_pkt_);
+        if (rc == 0) break;       // got a full packet?
+        if (rc < 0) return false; // end of file reached?
+      }
+
+    return true;
+  }
+
+
+  /** @brief Position poll thread main loop. */
+  void InputSocket::positionPacketPoll()
+  {
+    while(ros::ok())
+      {
+        // poll device until end of file
+        if (!pollPositionPacket())
+          break;
+      }
+  }
+
+  void InputSocket::imuPacketCounterCallback(const custom_msgs::PacketCounterConstPtr &msg)
+  {
+    boost::mutex::scoped_lock lock(imu_pc_queue_mutex_);
+
+    imu_pc_queue_.push_back(msg);
+    if (imu_pc_queue_.size() > 20)
+    {
+      imu_pc_queue_.pop_front();
+    }
   }
 
   ////////////////////////////////////////////////////////////////////////

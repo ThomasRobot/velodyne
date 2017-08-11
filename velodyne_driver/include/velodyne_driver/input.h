@@ -36,14 +36,24 @@
 #include <stdio.h>
 #include <pcap.h>
 #include <netinet/in.h>
+#include <deque>
 
 #include <ros/ros.h>
 #include <velodyne_msgs/VelodynePacket.h>
+#include <custom_msgs/PacketCounter.h>
+#include <boost/thread.hpp>
 
 namespace velodyne_driver
 {
   static uint16_t DATA_PORT_NUMBER = 2368;     // default data port
   static uint16_t POSITION_PORT_NUMBER = 8308; // default position port
+
+  struct PositionPacket
+  {
+    int hh, mm, ss;
+
+    PositionPacket() : hh(0), mm(0), ss(0) {}
+  };
 
   /** @brief Velodyne input base class */
   class Input
@@ -62,6 +72,7 @@ namespace velodyne_driver
      */
     virtual int getPacket(velodyne_msgs::VelodynePacket *pkt,
                           const double time_offset) = 0;
+    virtual int getPositionPacket(PositionPacket *pkt) {}
 
   protected:
     ros::NodeHandle private_nh_;
@@ -74,17 +85,27 @@ namespace velodyne_driver
   {
   public:
     InputSocket(ros::NodeHandle private_nh,
-                uint16_t port = DATA_PORT_NUMBER);
+                uint16_t port = DATA_PORT_NUMBER, uint16_t port2 = POSITION_PORT_NUMBER);
     virtual ~InputSocket();
 
     virtual int getPacket(velodyne_msgs::VelodynePacket *pkt, 
                           const double time_offset);
+    virtual int getPositionPacket(PositionPacket* pkt);
+    bool pollPositionPacket();
+    void positionPacketPoll();
     void setDeviceIP( const std::string& ip );
+    void imuPacketCounterCallback(const custom_msgs::PacketCounterConstPtr& msg);
   private:
 
   private:
     int sockfd_;
+    int sockfd2_;
     in_addr devip_;
+    boost::shared_ptr<boost::thread> positionPacketPollThread_;
+    PositionPacket pos_pkt_;
+    ros::Subscriber imu_pc_sub_;
+    std::deque<custom_msgs::PacketCounterConstPtr> imu_pc_queue_;
+    boost::mutex imu_pc_queue_mutex_;
   };
 
 
