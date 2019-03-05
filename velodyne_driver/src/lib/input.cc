@@ -250,7 +250,7 @@ namespace velodyne_driver
       static uint64_t last_ts = 0L; // in us
       uint64_t ts1 = pos_pkt_.hh     * 3600000000 + h_offset;
       uint64_t ts2 = (pos_pkt_.hh+1) * 3600000000 + h_offset;
-      if (std::abs(ts1-last_ts) < std::abs(ts2-last_ts))
+      if (std::abs<uint64_t>(ts1-last_ts) < std::abs<uint64_t>(ts2-last_ts))
       {
         last_ts = ts1;
       }
